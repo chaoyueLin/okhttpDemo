@@ -29,11 +29,139 @@ class PrintingEventListener extends EventListener
 
 ## 整体结构
 ![](./Okhttp.jpg)
+
 OKHttpClient，Request和Response，
+
 ![](./Okhttp.png)
+
 RealCal,负责请求的调度（同步的话走当前线程发送请求，异步的话则使用OKHttp内部的线程池进行）；同时负责构造内部逻辑责任链，并执行责任链相关的逻辑，直到获取结果。虽然OKHttpClient是整个OKHttp的核心管理类，但是真正发出请求并且组织逻辑的是RealCall类，它同时肩负了调度和责任链组织的两大重任，接下来我们来着重分析下RealCall类的逻辑。
+## 调度器Dispatcher
+记录同步任务、异步任务及等待执行的异步任务。
+线程池管理异步任务。
+发起/取消网络请求API：execute、enqueue、cancel。
+
+OkHttp设置了默认的最大并发请求量 maxRequests = 64 和单个host支持的最大并发量 maxRequestsPerHost = 5。
+同时用三个双端队列存储这些请求：
+
+	//异步任务等待队列
+	private val readyAsyncCalls = ArrayDeque<AsyncCall>()
+	//异步任务队列
+	private val runningAsyncCalls = ArrayDeque<AsyncCall>()
+	//同步任务队列
+	private val runningSyncCalls = ArrayDeque<RealCall>()
+
+	
+	private fun promoteAndExecute(): Boolean {
+	    val executableCalls = mutableListOf<AsyncCall>()
+	    val isRunning: Boolean
+	    synchronized(this) {
+	      val i = readyAsyncCalls.iterator()
+	      //遍历readyAsyncCalls
+	      while (i.hasNext()) {
+	        val asyncCall = i.next()
+	        //阈值校验
+	        if (runningAsyncCalls.size >= this.maxRequests) break // Max capacity.
+	        if (asyncCall.callsPerHost().get() >= this.maxRequestsPerHost) continue // Host max capacity.
+	        //符合条件 从readyAsyncCalls列表中删除
+	        i.remove()
+	        //per host 计数加1
+	        asyncCall.callsPerHost().incrementAndGet()
+	        executableCalls.add(asyncCall)
+	        //移入runningAsyncCalls列表
+	        runningAsyncCalls.add(asyncCall)
+	      }
+	      isRunning = runningCallsCount() > 0
+	    }
+	    
+	    for (i in 0 until executableCalls.size) {
+	      val asyncCall = executableCalls[i]
+	      //提交任务到线程池
+	      asyncCall.executeOn(executorService)
+	    }
+	    
+	    return isRunning
+	}
+
+	//异步任务执行结束
+	internal fun finished(call: AsyncCall) {
+	    call.callsPerHost().decrementAndGet()
+	    finished(runningAsyncCalls, call)
+	}
+	
+	//同步任务执行结束
+	internal fun finished(call: RealCall) {
+	    finished(runningSyncCalls, call)
+	}
+	
+	//同步异步任务 统一汇总到这里
+	private fun <T> finished(calls: Deque<T>, call: T) {
+	    val idleCallback: Runnable?
+	    synchronized(this) {
+	      //将完成的任务从队列中删除
+	      if (!calls.remove(call)) throw AssertionError("Call wasn't in-flight!")
+	      idleCallback = this.idleCallback
+	    }
+	    //这个方法在第一步中已经分析，用于将等待队列中的请求移入异步队列，并交由线程池执行。
+	    val isRunning = promoteAndExecute()
+	    
+	    //如果没有请求需要执行，回调闲置callback
+	    if (!isRunning && idleCallback != null) {
+	      idleCallback.run()
+	    }
+	}
+
+线程池
+
+
+	@get:JvmName("executorService") val executorService: ExecutorService
+	get() {
+	  if (executorServiceOrNull == null) {
+	    executorServiceOrNull = ThreadPoolExecutor(0, Int.MAX_VALUE, 60, TimeUnit.SECONDS,
+	        SynchronousQueue(), threadFactory("OkHttp Dispatcher", false))
+	  }
+	  return executorServiceOrNull!!
+	}
+
+阻塞队列用的SynchronousQueue，它的特点是不存储数据，当添加一个元素时，必须等待一个消费线程取出它，否则一直阻塞，如果当前有空闲线程则直接在这个空闲线程执行，如果没有则新启动一个线程执行任务。通常用于需要快速响应任务的场景，在网络请求要求低延迟的大背景下比较合适
+
 
 ## 责任链模式，或是拦截链模式
+
+
+	fun getResponseWithInterceptorChain(): Response {
+	    //创建拦截器数组
+	    val interceptors = mutableListOf<Interceptor>()
+	    //添加应用拦截器
+	    interceptors += client.interceptors
+	    //添加重试和重定向拦截器
+	    interceptors += RetryAndFollowUpInterceptor(client)
+	    //添加桥接拦截器
+	    interceptors += BridgeInterceptor(client.cookieJar)
+	    //添加缓存拦截器
+	    interceptors += CacheInterceptor(client.cache)
+	    //添加连接拦截器
+	    interceptors += ConnectInterceptor
+	    if (!forWebSocket) {
+	      //添加网络拦截器
+	      interceptors += client.networkInterceptors
+	    }
+	    //添加请求拦截器
+	    interceptors += CallServerInterceptor(forWebSocket)
+	    
+	    //创建责任链
+	    val chain = RealInterceptorChain(interceptors, transmitter, null, 0, originalRequest, this,
+	        client.connectTimeoutMillis, client.readTimeoutMillis, client.writeTimeoutMillis)
+	    ...
+	    try {
+	      //启动责任链
+	      val response = chain.proceed(originalRequest)
+	      ...
+	      return response
+	    } catch (e: IOException) {
+	      ...
+	    }
+	  }
+
 ### 拦截链demo已经抽出来
 * 拦截器按照添加顺序依次执行
 * 拦截器的执行从RealInterceptorChain.proceed()开始，进入到第一个拦截器的执行逻辑
