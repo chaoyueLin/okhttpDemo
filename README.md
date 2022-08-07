@@ -202,7 +202,7 @@ interceptors和NetworkInterceptors的区别
 * 规则3: 特殊的异常类型不进行重试（如ProtocolException，SSLHandshakeException等）
 * 规则4: 没有更多的route（包含proxy和inetaddress），不进行重试
 
-### BridgeInterceptor和CacheInterceptor
+### BridgeInterceptor
 BridageInterceptor拦截器的功能如下：
 
 负责把用户构造的请求转换为发送到服务器的请求 、把服务器返回的响应转换为用户友好的响应，是从应用程序代码到网络代码的桥梁
@@ -211,7 +211,10 @@ BridageInterceptor拦截器的功能如下：
 添加cookie
 设置其他报头，如User-Agent,Host,Keep-alive等。其中Keep-Alive是实现连接复用的必要步骤
 
-CacheInterceptor拦截器的逻辑流程如下：
+### CacheInterceptor
+
+拦截器的逻辑流程如下：
+
 * 1.通过Request尝试到Cache中拿缓存，当然前提是OkHttpClient中配置了缓存，默认是不支持的。
 * 2.根据response,time,request创建一个缓存策略，用于判断怎样使用缓存。
 * 3.如果缓存策略中设置禁止使用网络，并且缓存又为空，则构建一个Response直接返回，注意返回码=504
@@ -223,6 +226,187 @@ CacheInterceptor拦截器的逻辑流程如下：
 * 9.缓存起来的步骤也是先缓存header，再缓存body。
 * 10.返回Resposne
 
+
+		@Override public Response intercept(Chain chain) throws IOException {
+		  // 根据是否设置了缓存以及网络请求，得到一个候选缓存
+		  Response cacheCandidate = cache != null
+		      ? cache.get(chain.request())
+		      : null;
+		
+		  long now = System.currentTimeMillis();
+		
+		  // 根据当前时间、请求对象以及候选缓存，获取缓存策略
+		  // 在缓存策略中，有两个重要的对象
+		  // networkRequest: 网络请求，若为null表示不使用网络
+		  // cacheResponse: 响应缓存，若为null表示不使用缓存
+		  CacheStrategy strategy = new CacheStrategy.Factory(now, chain.request(), cacheCandidate).get();
+		  Request networkRequest = strategy.networkRequest;
+		  Response cacheResponse = strategy.cacheResponse;
+		
+		  if (cache != null) {
+		    cache.trackResponse(strategy);
+		  }
+		
+		  // 如果有候选缓存但是没有响应缓存，说明候选缓存不可用
+		  // 关闭它，以免内存泄漏
+		  if (cacheCandidate != null && cacheResponse == null) {
+		    closeQuietly(cacheCandidate.body()); // The cache candidate wasn't applicable. Close it.
+		  }
+		
+		  // If we're forbidden from using the network and the cache is insufficient, fail.
+		  // 不进行网络请求，且缓存以及过期了，返回504错误
+		  if (networkRequest == null && cacheResponse == null) {
+		    return new Response.Builder()
+		        .request(chain.request())
+		        .protocol(Protocol.HTTP_1_1)
+		        .code(504)
+		        .message("Unsatisfiable Request (only-if-cached)")
+		        .body(Util.EMPTY_RESPONSE)
+		        .sentRequestAtMillis(-1L)
+		        .receivedResponseAtMillis(System.currentTimeMillis())
+		        .build();
+		  }
+		
+		  // If we don't need the network, we're done.
+		  // 不需要网络请求，此时缓存命中，直接返回缓存，后面的拦截器的步骤也不会经过了
+		  if (networkRequest == null) {
+		    return cacheResponse.newBuilder()
+		        .cacheResponse(stripBody(cacheResponse))
+		        .build();
+		  }
+		
+		  // 没有缓存命中，则进行网络请求
+		  Response networkResponse = null;
+		  try {
+		    networkResponse = chain.proceed(networkRequest);
+		  } finally {
+		    // If we're crashing on I/O or otherwise, don't leak the cache body.
+		    if (networkResponse == null && cacheCandidate != null) {
+		      closeQuietly(cacheCandidate.body());
+		    }
+		  }
+		
+		  // If we have a cache response too, then we're doing a conditional get.
+		  // 如果缓存策略中，网络响应和响应缓存都不为null，需要更新响应缓存
+		  // (比如 需要向服务器确认缓存是否可用的情况)
+		  if (cacheResponse != null) {
+		    // 304的返回是不带body的,此时必须获取cache的body
+		    if (networkResponse.code() == HTTP_NOT_MODIFIED) {
+		      Response response = cacheResponse.newBuilder()
+		          .headers(combine(cacheResponse.headers(), networkResponse.headers()))
+		          .sentRequestAtMillis(networkResponse.sentRequestAtMillis())
+		          .receivedResponseAtMillis(networkResponse.receivedResponseAtMillis())
+		          .cacheResponse(stripBody(cacheResponse))
+		          .networkResponse(stripBody(networkResponse))
+		          .build();
+		      networkResponse.body().close();
+		
+		      // Update the cache after combining headers but before stripping the
+		      // Content-Encoding header (as performed by initContentStream()).
+		      cache.trackConditionalCacheHit();
+		      cache.update(cacheResponse, response);
+		      return response;
+		    } else {
+		      closeQuietly(cacheResponse.body());
+		    }
+		  }
+		
+		  // 走到这里，已经进行过网络请求了，请求响应不为空
+		  // 构建响应对象，等待返回
+		  Response response = networkResponse.newBuilder()
+		      .cacheResponse(stripBody(cacheResponse))
+		      .networkResponse(stripBody(networkResponse))
+		      .build();
+		
+		  if (cache != null) {
+		    // 将请求放到缓存中
+		    if (HttpHeaders.hasBody(response) && CacheStrategy.isCacheable(response, networkRequest)) {
+		      // Offer this request to the cache.
+		      CacheRequest cacheRequest = cache.put(response);
+		      return cacheWritingResponse(cacheRequest, response);
+		    }
+		
+		    // 如果请求不能被缓存，则移除该请求
+		    if (HttpMethod.invalidatesCache(networkRequest.method())) {
+		      try {
+		        cache.remove(networkRequest);
+		      } catch (IOException ignored) {
+		        // The cache cannot be written.
+		      }
+		    }
+		  }
+		
+		  return response;
+		}
+
+接下来看看另外一个要点：CacheStrategy是如何决定使不使用网络请求、响应缓存的。
+
+CacheStrategy.java
+
+		/** Returns a strategy to use assuming the request can use the network. */
+		private CacheStrategy getCandidate() {
+		  // No cached response.
+		  // 没有缓存
+		  if (cacheResponse == null) {
+		    return new CacheStrategy(request, null);
+		  }
+		
+		  // Drop the cached response if it's missing a required handshake.
+		  // https请求，但没有必要的握手信息，丢弃缓存
+		  if (request.isHttps() && cacheResponse.handshake() == null) {
+		    return new CacheStrategy(request, null);
+		  }
+		
+		  // If this response shouldn't have been stored, it should never be used
+		  // as a response source. This check should be redundant as long as the
+		  // persistence store is well-behaved and the rules are constant.
+		  // 不应该被缓存，丢弃缓存
+		  if (!isCacheable(cacheResponse, request)) {
+		    return new CacheStrategy(request, null);
+		  }
+		
+		  CacheControl requestCaching = request.cacheControl();
+		  ...
+		  // 根据缓存的缓存时间，缓存可接受最大过期时间等等HTTP协议上的规范，来判断缓存是否可用
+		  if (!responseCaching.noCache() && ageMillis + minFreshMillis < freshMillis + maxStaleMillis) {
+		    Response.Builder builder = cacheResponse.newBuilder();
+		    if (ageMillis + minFreshMillis >= freshMillis) {
+		      builder.addHeader("Warning", "110 HttpURLConnection \"Response is stale\"");
+		    }
+		    long oneDayMillis = 24 * 60 * 60 * 1000L;
+		    if (ageMillis > oneDayMillis && isFreshnessLifetimeHeuristic()) {
+		      builder.addHeader("Warning", "113 HttpURLConnection \"Heuristic expiration\"");
+		    }
+		    return new CacheStrategy(null, builder.build());
+		  }
+		
+		  // Find a condition to add to the request. If the condition is satisfied, the response body
+		  // will not be transmitted.
+		  // 请求条件, 当etag、lastModified、servedDate这三种属性存在时，需要向服务器确认缓存的有效性
+		  String conditionName;
+		  String conditionValue;
+		  if (etag != null) {
+		    conditionName = "If-None-Match";
+		    conditionValue = etag;
+		  } else if (lastModified != null) {
+		    conditionName = "If-Modified-Since";
+		    conditionValue = lastModifiedString;
+		  } else if (servedDate != null) {
+		    conditionName = "If-Modified-Since";
+		    conditionValue = servedDateString;
+		  } else {
+		    return new CacheStrategy(request, null); // No condition! Make a regular request.
+		  }
+		
+		  Headers.Builder conditionalRequestHeaders = request.headers().newBuilder();
+		  Internal.instance.addLenient(conditionalRequestHeaders, conditionName, conditionValue);
+		
+		  // 构造一个请求询问服务器资源是否过期
+		  Request conditionalRequest = request.newBuilder()
+		      .headers(conditionalRequestHeaders.build())
+		      .build();
+		  return new CacheStrategy(conditionalRequest, cacheResponse);
+		}
 
 ### ConnectInterceptor
 connectInterceptor应该是最重要的拦截器之一了，它同时负责了Dns解析和Socket连接（包括tls连接）。
